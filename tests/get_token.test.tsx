@@ -67,6 +67,123 @@ describe("silent token lifecycle", () => {
     localStorage.clear();
     sessionStorage.clear();
     jest.restoreAllMocks();
+    jest.useRealTimers();
+  });
+
+  test.each(["headers", "success body", "error body"])(
+    "times out stalled %s, releases the token lock, and ignores late responses",
+    async (phase) => {
+      jest.useFakeTimers();
+      seedSession(localStorage, -10);
+      const previousSession = { ...localStorage };
+      let releaseResponse!: () => void;
+      const stalled = new Promise<void>((resolve) => {
+        releaseResponse = resolve;
+      });
+      let signal!: AbortSignal;
+      jest.mocked(fetch).mockImplementationOnce(async (_url, options) => {
+        signal = options!.signal!;
+        if (phase === "headers") await stalled;
+        return {
+          ok: phase !== "error body",
+          status: phase === "error body" ? 400 : 200,
+          statusText: "Bad Request",
+          json: async () => {
+            if (phase === "success body") await stalled;
+            return {
+              access_token: "late-access-token",
+              id_token: makeIdToken(900),
+              refresh_token: "late-refresh-token",
+            };
+          },
+          text: async () => {
+            await stalled;
+            return JSON.stringify({ error: "invalid_grant" });
+          },
+        } as Response;
+      });
+      const { result } = renderAuth();
+      let settled = false;
+      const pendingId = result.current.getIdTokenSilently();
+      expect(result.current.getIdTokenSilently()).toBe(pendingId);
+      const outcome = pendingId.catch((error: unknown) => {
+        settled = true;
+        return error;
+      });
+      const pendingAccess = result.current.getTokenSilently();
+
+      await act(async () => {
+        await jest.advanceTimersByTimeAsync(29_999);
+      });
+      expect(settled).toBe(false);
+      expect(signal.aborted).toBe(false);
+      await act(async () => {
+        await jest.advanceTimersByTimeAsync(1);
+      });
+
+      expect(await outcome).toMatchObject({ name: "TimeoutError" });
+      expect(await outcome).not.toBeInstanceOf(AuthenticationRequiredError);
+      expect(signal.aborted).toBe(true);
+      await expect(pendingAccess).resolves.toBe("access-token");
+      expect({ ...localStorage }).toEqual(previousSession);
+      expect(result.current.isAuthenticated).toBe(true);
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(jest.getTimerCount()).toBe(0);
+
+      await act(async () => {
+        releaseResponse();
+        await jest.advanceTimersByTimeAsync(0);
+      });
+      expect({ ...localStorage }).toEqual(previousSession);
+
+      const refreshedIdToken = respondWith();
+      await act(async () => {
+        await expect(result.current.getIdTokenSilently()).resolves.toBe(
+          refreshedIdToken,
+        );
+      });
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(jest.getTimerCount()).toBe(0);
+    },
+  );
+
+  test("bounds access-token refresh and releases the lock for a fresh ID token", async () => {
+    jest.useFakeTimers();
+    seedSession(localStorage, 600, -10);
+    const idToken = JSON.parse(localStorage.getItem("ROCP_idToken")!);
+    jest.mocked(fetch).mockImplementationOnce(
+      (_url, options) =>
+        new Promise((_resolve, reject) => {
+          options!.signal!.addEventListener("abort", () =>
+            reject(new DOMException("Request aborted", "AbortError")),
+          );
+        }),
+    );
+    const { result } = renderAuth();
+    const outcome = result.current.getTokenSilently().catch((error) => error);
+    const pendingId = result.current.getIdTokenSilently();
+
+    await act(async () => {
+      await jest.advanceTimersByTimeAsync(30_000);
+    });
+
+    expect(await outcome).toMatchObject({ name: "TimeoutError" });
+    await expect(pendingId).resolves.toBe(idToken);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  test("clears the deadline after an immediate network failure", async () => {
+    jest.useFakeTimers();
+    seedSession(localStorage, -10);
+    const failure = new TypeError("Network unavailable");
+    jest.mocked(fetch).mockRejectedValueOnce(failure);
+    const { result } = renderAuth();
+
+    await expect(result.current.getIdTokenSilently()).rejects.toBe(failure);
+
+    expect(jest.getTimerCount()).toBe(0);
+    expect(localStorage.getItem("ROCP_refreshToken")).not.toBeNull();
   });
 
   test.each([
@@ -551,6 +668,41 @@ describe("make token request", () => {
     window.location.search = "?code=1234";
   });
 
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  test("ends the callback loading state when token exchange times out", async () => {
+    jest.useFakeTimers();
+    jest.mocked(fetch).mockImplementationOnce(
+      (_url, options) =>
+        new Promise((_resolve, reject) => {
+          options!.signal!.addEventListener("abort", () =>
+            reject(new DOMException("Request aborted", "AbortError")),
+          );
+        }),
+    );
+    const { result } = renderHook(() => useContext(AuthContext), {
+      wrapper: ({ children }) => (
+        <AuthProvider authConfig={authConfig}>{children}</AuthProvider>
+      ),
+    });
+    expect(result.current.isLoading).toBe(true);
+
+    await act(async () => {
+      await jest.advanceTimersByTimeAsync(30_000);
+    });
+
+    expect(result.current.isLoading).toBe(false);
+    expect(result.current.isAuthenticated).toBe(false);
+    expect(result.current.error).toBe(
+      "Token request timed out after 30 seconds",
+    );
+    expect(localStorage.getItem("ROCP_token")).toBeNull();
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
   test("does not exchange the code after state validation fails", async () => {
     localStorage.setItem("ROCP_auth_state", "expected-state");
     render(
@@ -577,6 +729,7 @@ describe("make token request", () => {
         },
         method: "POST",
         credentials: "same-origin",
+        signal: expect.any(AbortSignal),
       }),
     );
   });
@@ -598,6 +751,7 @@ describe("make token request", () => {
         },
         method: "POST",
         credentials: "include",
+        signal: expect.any(AbortSignal),
       }),
     );
   });

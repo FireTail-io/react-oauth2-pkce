@@ -31,6 +31,15 @@ Calling `logIn()` while login is already in progress is a no-op. Logout discards
 in-flight refresh results. Omitted refresh tokens retain the previous token and
 absolute expiry. Omitted ID tokens are retained only while still usable.
 
+Token exchanges and refreshes have a 30-second deadline, including response-body
+consumption. A deadline aborts the fetch and rejects with a `TimeoutError`
+(`DOMException`), releases the refresh locks, and leaves stored credentials intact.
+Late responses are ignored and timers are cleared on success or failure. Timeout
+does not mean `AuthenticationRequiredError`; there is no automatic retry. The
+provider may have processed a timed-out refresh and rotated its token, so a later
+caller retry can still receive `invalid_grant` and require authentication. The
+deadline begins when the request starts, not while waiting to acquire a lock.
+
 The identity provider must issue ID tokens on login and refresh with an `exp`
 claim. Expiry decoding is for scheduling only; the resource server must validate
 signature, issuer, audience and required claims. ID-token acceptance must be an
